@@ -141,7 +141,7 @@ static void align_to_second(long lead_ns) {
     }
 }
 
-static int cmd_clock(const char *timearg, int nowait) {
+static int cmd_clock_legacy(const char *timearg, int nowait) {
     struct tm tmv;
     time_t t;
     if (timearg) {
@@ -186,9 +186,9 @@ static int cmd_clock(const char *timearg, int nowait) {
     return 0;
 }
 
-/* Read the device clock back. Whole seconds only -- sub-second phase is
- * recovered by polling this fast and watching for the increment. */
-static int cmd_clock_read(void) {
+/* Read the device clock back (legacy, whole seconds). Kept for firmware that
+ * predates the sub-second tail; cmd_clock_read() below handles both. */
+static int cmd_clock_read_legacy(void) {
     unsigned char p[3] = {ID_CUSTOM_SET_VALUE, RTC_CHANNEL, RTC_GET_TIME};
     unsigned char rep[32];
     if (xfer(p, sizeof p, rep) < 0) return 1;
@@ -201,6 +201,210 @@ static int cmd_clock_read(void) {
     printf("host   %04d-%02d-%02d %02d:%02d:%02d.%03ld\n",
            ht.tm_year + 1900, ht.tm_mon + 1, ht.tm_mday,
            ht.tm_hour, ht.tm_min, ht.tm_sec, now.tv_nsec / 1000000L);
+    return 0;
+}
+
+/* ---- Sub-second clock sync (clock-sync plan 3.8) --------------------------
+ * Firmware with RTC_PROTO_VERSION 2 returns a sub-second tail in the GET
+ * reply ([11] version, [12..15] SECCNT, [16..17] period) and accepts
+ * RTC_SET_TIME_MS: "at the instant this packet was received, true time was
+ * t + ms". The host measures offset with NTP arithmetic (T3 = T2), sends
+ * the set with an empirically CALIBRATED outbound lead, and learns the lead
+ * from the firmware's own report of the offset it saw at receipt:
+ *     o  = board - host              (GET, min-RTT sample)
+ *     o' = target - board_at_receipt (SET reply)  = lead - delay - o
+ *     e  = o' + o = lead - delay     ->  lead -= e/4   (converges on delay)
+ * Signs verified in clock-sync-plan/review-codex-2026-09-01-round4.md. */
+#define RTC_SET_TIME_MS   0x03
+#define RTC_PROTO_VERSION 2
+
+typedef struct { int proto; double lead_ms; int b_ppm; int has_bias; } cap_t;
+
+static const char *cap_path(void) {
+    static char p[512];
+    const char *h = getenv("HOME");
+    snprintf(p, sizeof p, "%s/.ak820ctl-cap", h ? h : ".");
+    return p;
+}
+static cap_t cap_load(void) {
+    cap_t c = { 0, 1.5, 0, 0 };
+    FILE *f = fopen(cap_path(), "r");
+    if (f) {
+        int n = fscanf(f, "%d %lf %d", &c.proto, &c.lead_ms, &c.b_ppm);
+        if (n < 2) { c.proto = 0; c.lead_ms = 1.5; }
+        c.has_bias = (n == 3);
+        fclose(f);
+    }
+    if (c.lead_ms < 0 || c.lead_ms > 10) c.lead_ms = 1.5;
+    if (c.b_ppm < -600 || c.b_ppm > 600) c.has_bias = 0;
+    return c;
+}
+static void cap_save(cap_t c) {
+    FILE *f = fopen(cap_path(), "w");
+    if (f) {
+        if (c.has_bias) fprintf(f, "%d %.3f %d\n", c.proto, c.lead_ms, c.b_ppm);
+        else            fprintf(f, "%d %.3f\n", c.proto, c.lead_ms);
+        fclose(f);
+    }
+}
+
+static double now_s(void) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+static double host_sod(double t) {            /* host local seconds-of-day, fractional */
+    time_t s = (time_t)t; struct tm lt = *localtime(&s);
+    return lt.tm_hour * 3600.0 + lt.tm_min * 60.0 + lt.tm_sec + (t - (double)s);
+}
+/* Board seconds-of-day from a GET reply; <0 if the clock is unset.
+ * The fraction is 1 - (active_period+1 - cnt)/(nominal_period+1): the
+ * cycles REMAINING to the next boundary, measured in nominal seconds. In
+ * steady state (active == nominal) that is cnt/(P+1); inside the shortened
+ * first period after a phase set it is still correct, where the naive
+ * cnt/(active+1) would read the fraction of the remaining window instead
+ * (seen as an "after" residual growing to -790 ms across ten syncs). */
+static double board_sod(const unsigned char *rep) {
+    if (!rep[3]) return -1;
+    unsigned cnt  = rep[12] | rep[13] << 8 | rep[14] << 16 | (unsigned)rep[15] << 24;
+    unsigned per  = rep[16] | rep[17] << 8;
+    unsigned pnom = rep[18] | rep[19] << 8;
+    if (pnom == 0) pnom = per;
+    double frac = 1.0 - ((double)per + 1.0 - (double)cnt) / ((double)pnom + 1.0);
+    return rep[8] * 3600.0 + rep[9] * 60.0 + rep[10] + frac;
+}
+static double wrap_day(double d) { if (d > 43200) d -= 86400; if (d < -43200) d += 86400; return d; }
+
+/* One GET. 0 ok, -1 no reply, -2 clock unset. off = board - host (ms). */
+static int get_offset(double *off_ms, double *rtt_ms, int *proto, unsigned char *rep) {
+    unsigned char p[3] = {ID_CUSTOM_SET_VALUE, RTC_CHANNEL, RTC_GET_TIME};
+    double t0 = now_s();
+    if (xfer(p, sizeof p, rep) < 0) return -1;
+    double t1 = now_s();
+    *proto  = rep[11];
+    *rtt_ms = (t1 - t0) * 1000.0;
+    double b = board_sod(rep);
+    if (b < 0) return -2;
+    *off_ms = wrap_day(b - host_sod((t0 + t1) / 2)) * 1000.0;
+    return 0;
+}
+
+/* Build and send RTC_SET_TIME_MS for host time (t_enc + lead). */
+static int send_set_ms(double lead_ms, int b_ppm, int has_bias, int nowait, unsigned char *rep) {
+    double t_enc  = now_s();
+    double target = t_enc + lead_ms / 1000.0;
+    time_t ts = (time_t)target;
+    unsigned ms = (unsigned)((target - (double)ts) * 1000.0);
+    if (ms > 999) ms = 999;
+    struct tm tmv = *localtime(&ts);
+    unsigned char p[15] = {
+        ID_CUSTOM_SET_VALUE, RTC_CHANNEL, RTC_SET_TIME_MS,
+        (unsigned char)(tmv.tm_year + 1900 - 2000), (unsigned char)(tmv.tm_mon + 1),
+        (unsigned char)tmv.tm_mday, (unsigned char)tmv.tm_wday,
+        (unsigned char)tmv.tm_hour, (unsigned char)tmv.tm_min, (unsigned char)tmv.tm_sec,
+        (unsigned char)(ms & 0xFF), (unsigned char)(ms >> 8),
+        0,                       /* flags */
+        (unsigned char)(has_bias ? (b_ppm & 0xFF) : 0xFF),          /* sof_bias s16 LE, */
+        (unsigned char)(has_bias ? ((b_ppm >> 8) & 0xFF) : 0x7F),   /* 0x7FFF = unknown */
+    };
+    if (nowait) return xfer_nowait(p, sizeof p);
+    return xfer(p, sizeof p, rep);
+}
+
+static int cmd_clock(const char *timearg, int nowait) {
+    if (timearg) return cmd_clock_legacy(timearg, nowait);   /* explicit time: whole seconds, as before */
+    cap_t cap = cap_load();
+
+    if (nowait) {
+        /* Send-only (a reply-less transport). Uses the cached capability. */
+        if (cap.proto != RTC_PROTO_VERSION) return cmd_clock_legacy(NULL, 1);
+        if (send_set_ms(cap.lead_ms, cap.b_ppm, cap.has_bias, 1, NULL) < 0) return 1;
+        printf("clock set (sub-second, lead %.2f ms, sent, unconfirmed)\n", cap.lead_ms);
+        return 0;
+    }
+
+    /* Measure: five GETs, keep the min-RTT sample. */
+    unsigned char rep[32];
+    double off = 0, rtt = 0, best_off = 0, rtt_min = 1e9, rtt_max = 0;
+    int proto = 0, good = 0, was_slewing = 0;
+    for (int i = 0; i < 5; i++) {
+        int rc = get_offset(&off, &rtt, &proto, rep);
+        if (rc == -1) return 1;
+        if (proto != RTC_PROTO_VERSION) break;
+        if (rc == -2) continue;                     /* clock unset: still fine to set */
+        if (rep[20] & 0x02) was_slewing = 1;        /* a slew moves the board 20 ms/s: not a calibration sample */
+        good++;
+        if (rtt < rtt_min) { rtt_min = rtt; best_off = off; }
+        if (rtt > rtt_max) rtt_max = rtt;
+    }
+    if (proto == 0) {
+        printf("firmware without the sub-second protocol: legacy set\n");
+        cap.proto = 0; cap_save(cap);
+        return cmd_clock_legacy(NULL, 0);
+    }
+    if (proto != RTC_PROTO_VERSION) {
+        fprintf(stderr, "unknown RTC protocol version %d -- refusing to act\n", proto);
+        return 1;
+    }
+    double U = good ? (rtt_max - rtt_min) / 2.0 + 0.5 : 0;
+
+    /* Set, with the calibrated lead; retry once on 0xFE. */
+    int st = 0;
+    for (int tries = 0; tries < 2; tries++) {
+        if (send_set_ms(cap.lead_ms, cap.b_ppm, cap.has_bias, 0, rep) < 0) return 1;
+        st = rep[3];
+        if (st != 0xFE) break;
+    }
+    if (st == 0xFF) { fprintf(stderr, "firmware rejected the set (validation)\n"); return 1; }
+    if (st == 0xFE) { fprintf(stderr, "firmware busy (stale read) twice -- try again\n"); return 1; }
+    double o_prime = (double)(short)(rep[4] | rep[5] << 8);
+
+    /* Learn the outbound lead from what the board saw at receipt -- only from
+     * a board that was NOT mid-slew when measured (PLAN.md 3.8). */
+    /* Only a SLEW-sized correction on a settled board is a calibration
+     * sample: a step (|offset| > 500 ms, e.g. right after a flash while the
+     * clock still drifts ~10 ms/s) blew the lead to its clamp once. Each
+     * update moves the lead by at most 1 ms. */
+    if (good && !was_slewing && st != 0 && best_off > -500 && best_off < 500) {
+        double e = o_prime + best_off;
+        double adj = -e / 4.0;
+        if (adj > 1.0) adj = 1.0;
+        if (adj < -1.0) adj = -1.0;
+        cap.lead_ms += adj;
+        if (cap.lead_ms < 0) cap.lead_ms = 0;
+        if (cap.lead_ms > 10) cap.lead_ms = 10;
+    }
+    cap.proto = RTC_PROTO_VERSION;
+    cap_save(cap);
+
+    /* Verify. */
+    double after = 0, rtt2 = 0; int pr2 = 0;
+    int rc = get_offset(&after, &rtt2, &pr2, rep);
+    printf("clock set (sub-second): before %+.1f ms, after %+.1f ms, rtt %.1f ms, U ~%.1f ms, lead now %.2f ms, bias %s%s\n",
+           good ? best_off : 0.0, rc == 0 ? after : 0.0, rtt_min < 1e9 ? rtt_min : rtt2, U, cap.lead_ms,
+           cap.has_bias ? "sent" : "unknown", st == 1 ? " (slewing)" : "");
+    if (rc == 0 && good && st == 0 && (after > 3 * U + 3 || after < -(3 * U + 3)))
+        printf("warning: residual %+.1f ms exceeds 3U -- lead still calibrating, or a slew is in progress\n", after);
+    return 0;
+}
+
+static int cmd_clock_read(void) {
+    unsigned char rep[32];
+    double off = 0, rtt = 0; int proto = 0;
+    int rc = get_offset(&off, &rtt, &proto, rep);
+    if (rc == -1) return 1;
+    if (proto != RTC_PROTO_VERSION) return cmd_clock_read_legacy();
+    unsigned cnt = rep[12] | rep[13] << 8 | rep[14] << 16 | (unsigned)rep[15] << 24;
+    unsigned per = rep[16] | rep[17] << 8, pnom = rep[18] | rep[19] << 8;
+    {
+        double frac = 1.0 - ((double)per + 1.0 - (double)cnt) / ((double)pnom + 1.0);
+        printf("device %04d-%02d-%02d %02d:%02d:%02d%+.3f  (cnt %u / period %u, nominal %u)\n",
+               2000 + rep[4], rep[5], rep[6], rep[8], rep[9], rep[10], frac, cnt, per, pnom);
+    }
+    if (rc == -2) { printf("device clock not set\n"); return 1; }
+    printf("offset board-host %+.1f ms  rtt %.1f ms  flags 0x%02x  ref_state %u  sync_age %u min  last_host_offset %d ms\n",
+           off, rtt, rep[20], rep[25], rep[26], (short)(rep[21] | rep[22] << 8));
+    printf("sof_epoch %u  sof_frames_total %u  bias_in_use %d ppm\n", rep[27],
+           rep[28] | rep[29] << 8 | rep[30] << 16 | (unsigned)rep[31] << 24, (short)(rep[23] | rep[24] << 8));
     return 0;
 }
 
@@ -366,6 +570,10 @@ int main(int argc, char **argv) {
             if (!strcmp(argv[i], "--no-wait")) nowait = 1;
             else if (!strcmp(argv[i], "--read")) targ = argv[i];
             else if (!targ)                    targ   = argv[i];
+        }
+        if (targ && !strcmp(targ, "--bias") && argc > 3) {
+            cap_t cap = cap_load(); cap.b_ppm = atoi(argv[3]); cap.has_bias = 1; cap_save(cap);
+            printf("sof bias %d ppm cached in %s\n", cap.b_ppm, cap_path()); return 0;
         }
         if (targ && !strcmp(targ, "--read")) rc = cmd_clock_read();
         else                                 rc = cmd_clock(targ, nowait);
