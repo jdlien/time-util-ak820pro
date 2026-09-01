@@ -5,3 +5,4 @@ assets/*.bin
 assets/raw/
 *.o
 __pycache__/
+.DS_Store
