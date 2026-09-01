@@ -31,6 +31,7 @@
 
 #define RTC_CHANNEL   0x10
 #define RTC_SET_TIME  0x01
+#define RTC_GET_TIME  0x02
 
 #define FLASH_CHANNEL  0x11
 #define FC_INFO        0x01
@@ -82,6 +83,24 @@ static int xfer(const unsigned char *payload, int len, unsigned char *rep) {
     return 0;
 }
 
+// Fire-and-forget write: no reply is read, so this works in BT/2.4G mode too.
+//
+// WHY THIS EXISTS: the firmware routes raw-HID REPLIES through the active host
+// driver (see host_raw_hid_send), so in wireless mode the answer is sent over the
+// air where we are not listening, and every round-trip command fails -- even with
+// the USB cable plugged in. Inbound reports are unaffected, which is why a
+// one-way command still lands. Setting the clock needs no confirmation: if it
+// silently fails, the next scheduled run fixes it.
+static int xfer_nowait(const unsigned char *payload, int len) {
+    unsigned char buf[33] = {0};      // buf[0] = report id (stripped on the wire)
+    memcpy(&buf[1], payload, len);
+    if (hid_write(dev, buf, sizeof buf) < 0) {
+        fprintf(stderr, "write failed: %ls\n", hid_error(dev));
+        return -1;
+    }
+    return 0;
+}
+
 // Flash commands share a header; retries absorb FS_BUSY, which the firmware
 // returns instead of blocking (a synchronous erase would stall the matrix scan).
 static int fcmd(unsigned char cmd, const unsigned char *args, int nargs, unsigned char *rep) {
@@ -97,9 +116,46 @@ static int fcmd(unsigned char cmd, const unsigned char *args, int nargs, unsigne
     return 0;
 }
 
-static int cmd_clock(const char *timearg) {
+/* Sleep until just before the next second boundary.
+ *
+ * WHY: time() returns WHOLE seconds. Firing at 12:34:56.812 tells the device
+ * "56" when it is nearly 57 -- a lag uniform on [0,1), mean 0.5 s, injected by
+ * the sync itself. The wire packet has no sub-second field and widening it was
+ * rejected, so the only channel for sub-second precision is WHEN we transmit.
+ *
+ * lead_ns is how early to wake so the packet ARRIVES on the boundary: roughly
+ * one 1 ms HID poll, plus firmware handling, plus the ~700 us bit-banged I2C
+ * write to the PCF. 2 ms is a placeholder -- measure a round trip with
+ * `clock --read` and use half of it. */
+#ifndef XFER_LEAD_NS
+#    define XFER_LEAD_NS 2000000L   /* 2 ms, placeholder -- see above */
+#endif
+
+static void align_to_second(long lead_ns) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long ns = 1000000000L - ts.tv_nsec - lead_ns;
+    if (ns > 0) {
+        struct timespec req = {0, ns};
+        nanosleep(&req, NULL);
+    }
+}
+
+static int cmd_clock(const char *timearg, int nowait) {
     struct tm tmv;
-    time_t t = time(NULL);
+    time_t t;
+    if (timearg) {
+        t = time(NULL);
+    } else {
+        /* Re-read AFTER the sleep and round to the NEAREST boundary, so both
+         * nanosleep undershoot (wake at .998 -> round up) and overshoot (wake at
+         * .003 past -> round down) send the second that is true on arrival.
+         * macOS will overshoot under load; this is robust to it either way. */
+        struct timespec ts;
+        align_to_second(XFER_LEAD_NS);
+        clock_gettime(CLOCK_REALTIME, &ts);
+        t = ts.tv_sec + (ts.tv_nsec > 500000000L ? 1 : 0);
+    }
     tmv = *localtime(&t);
     if (timearg) {
         int Y, M, D, h, m, s;
@@ -117,11 +173,34 @@ static int cmd_clock(const char *timearg) {
         (unsigned char)tmv.tm_mday, (unsigned char)tmv.tm_wday,
         (unsigned char)tmv.tm_hour, (unsigned char)tmv.tm_min, (unsigned char)tmv.tm_sec,
     };
+    if (nowait) {
+        if (xfer_nowait(p, sizeof p) < 0) return 1;
+    } else {
+        unsigned char rep[32];
+        if (xfer(p, sizeof p, rep) < 0) return 1;
+    }
+    printf("clock set to %04d-%02d-%02d %02d:%02d:%02d%s\n",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+           nowait ? " (sent, unconfirmed)" : "");
+    return 0;
+}
+
+/* Read the device clock back. Whole seconds only -- sub-second phase is
+ * recovered by polling this fast and watching for the increment. */
+static int cmd_clock_read(void) {
+    unsigned char p[3] = {ID_CUSTOM_SET_VALUE, RTC_CHANNEL, RTC_GET_TIME};
     unsigned char rep[32];
     if (xfer(p, sizeof p, rep) < 0) return 1;
-    printf("clock set to %04d-%02d-%02d %02d:%02d:%02d\n",
-           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
-           tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    if (!rep[3]) { fprintf(stderr, "device clock not readable\n"); return 1; }
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    struct tm ht = *localtime(&now.tv_sec);
+    printf("device %04d-%02d-%02d %02d:%02d:%02d\n",
+           2000 + rep[4], rep[5], rep[6], rep[8], rep[9], rep[10]);
+    printf("host   %04d-%02d-%02d %02d:%02d:%02d.%03ld\n",
+           ht.tm_year + 1900, ht.tm_mon + 1, ht.tm_mday,
+           ht.tm_hour, ht.tm_min, ht.tm_sec, now.tv_nsec / 1000000L);
     return 0;
 }
 
@@ -238,7 +317,7 @@ static int cmd_crc(unsigned long addr, unsigned long len) {
 static void usage(const char *a0) {
     fprintf(stderr,
         "usage:\n"
-        "  %s clock [YYYY-MM-DDTHH:MM:SS]   set the RTC (default: host time)\n"
+        "  %s clock [YYYY-MM-DDTHH:MM:SS] [--no-wait]   set the RTC (default: host time)\n        --no-wait: do not read a reply, so it also works in BT/2.4G mode\n"
         "  %s info                          flash id + writable base\n"
         "  %s flash write <addr> <file> [--unlock]\n"
         "  %s flash erase <addr> [sectors]  4K sectors (default 1)\n"
@@ -281,7 +360,15 @@ int main(int argc, char **argv) {
     int rc = 1;
 
     if (!strcmp(argv[1], "clock")) {
-        rc = cmd_clock(argc > 2 ? argv[2] : NULL);
+        int nowait = 0;
+        const char *targ = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--no-wait")) nowait = 1;
+            else if (!strcmp(argv[i], "--read")) targ = argv[i];
+            else if (!targ)                    targ   = argv[i];
+        }
+        if (targ && !strcmp(targ, "--read")) rc = cmd_clock_read();
+        else                                 rc = cmd_clock(targ, nowait);
     } else if (!strcmp(argv[1], "info")) {
         rc = cmd_info();
     } else if (!strcmp(argv[1], "flash") && argc >= 3) {
