@@ -1,5 +1,25 @@
 # ak820ctl — AK820 Pro host toolkit
 
+> **This fork serves [jdlien/ak820-pro](https://github.com/jdlien/ak820-pro)**,
+> JD's firmware for the AK820 Pro, built from
+> [jdlien/qmk_firmware](https://github.com/jdlien/qmk_firmware/tree/ak820pro-jdlien).
+> Its work, including sub-second clock sync, is on the
+> [`ak820pro-local`](https://github.com/jdlien/time-util-ak820pro/tree/ak820pro-local)
+> branch, which that repo's `setup.sh` builds. It is forked from
+> [fpb/time-util-ak820pro](https://github.com/fpb/time-util-ak820pro).
+>
+> - **Keeping the clock in sync is superseded** on Windows and macOS by the
+>   `ak820` agent in [jdlien/ak820-pro](https://github.com/jdlien/ak820-pro)
+>   (`ak820-agent/`). It keeps the LCD clock within a few milliseconds and shows
+>   what is playing. Windows installs it from that repo's Releases; macOS has no
+>   release yet. `ak820ctl clock` still sets the clock once, and on Linux it is
+>   the only way.
+> - **Still current: writing the LCD assets and GIF animations** into the
+>   keyboard's SPI flash (`ak820ctl flash write`). The `ak820` agent never writes
+>   flash, by design.
+> - The branch table below describes fpb's original firmware branches. On JD's
+>   firmware both the clock and the flash commands work.
+
 Host-side tools for an **Ajazz AK820 Pro** running the custom
 [QMK firmware](https://github.com/fpb/qmk_firmware) (USB VID `0x0C45`,
 PID `0x8009`). One command-line program, **`ak820ctl`**, talks to the keyboard
